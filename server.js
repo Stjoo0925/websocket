@@ -1,156 +1,114 @@
-const express = require("express");
-const http = require("http");
-const socketIo = require("socket.io");
-const path = require("path");
-const multer = require("multer");
-const fs = require("fs");
+const { createServer } = require("http");
+const { Server } = require("socket.io");
+const next = require("next");
 
-const app = express();
-const server = http.createServer(app);
-const io = socketIo(server);
+const dev = process.env.NODE_ENV !== "production";
+const app = next({ dev });
+const handle = app.getRequestHandler();
 
-// 정적 파일 제공
-app.use(express.static(path.join(__dirname, "public")));
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-// Multer 설정 (파일 업로드)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "uploads/");
-  },
-  filename: (req, file, cb) => {
-    // 파일명 중복 방지를 위해 timestamp 추가
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  },
-});
-
-const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB 제한
-  },
-  fileFilter: (req, file, cb) => {
-    // 이미지 파일만 허용
-    if (file.mimetype.startsWith("image/")) {
-      cb(null, true);
-    } else {
-      cb(new Error("이미지 파일만 업로드 가능합니다."));
-    }
-  },
-});
-
-// 메인 페이지 라우트
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-// 파일 업로드 라우트
-app.post("/upload", upload.single("image"), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "파일이 업로드되지 않았습니다." });
-    }
-
-    const imageUrl = `/uploads/${req.file.filename}`;
-    res.json({
-      success: true,
-      imageUrl: imageUrl,
-      originalName: req.file.originalname,
-    });
-  } catch (error) {
-    console.error("File upload error:", error);
-    res.status(500).json({ error: "파일 업로드 중 오류가 발생했습니다." });
-  }
-});
-
-// 연결된 사용자 목록
 const users = new Map();
 
-// Socket.IO 연결 처리
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-
-  // 사용자 입장 처리
-  socket.on("join", (username) => {
-    users.set(socket.id, username);
-
-    // 다른 사용자들에게 새 사용자 입장 알림
-    socket.broadcast.emit("user joined", {
-      username: username,
-      message: `${username}님이 채팅방에 입장했습니다.`,
-      timestamp: new Date().toLocaleTimeString(),
-    });
-
-    // 현재 접속자 수 업데이트
-    io.emit("user count", users.size);
-
-    console.log(`${username} joined the chat`);
+app.prepare().then(() => {
+  const server = createServer((req, res) => {
+    handle(req, res);
   });
 
-  // 채팅 메시지 처리
-  socket.on("chat message", (data) => {
-    const username = users.get(socket.id);
-    if (username) {
-      const messageData = {
-        username: username,
-        message: data.message,
-        timestamp: new Date().toLocaleTimeString(),
-        type: data.type || "text", // 'text' 또는 'image'
-      };
-
-      // 이미지 메시지인 경우 추가 정보 포함
-      if (data.type === "image") {
-        messageData.imageUrl = data.imageUrl;
-        messageData.originalName = data.originalName;
-      }
-
-      // 모든 클라이언트에게 메시지 전송
-      io.emit("chat message", messageData);
-
-      console.log(
-        `Message from ${username}: ${
-          data.type === "image" ? "[Image]" : data.message
-        }`
-      );
-    }
+  const io = new Server(server, {
+    path: "/api/socketio",
+    addTrailingSlash: false,
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"],
+    },
+    transports: ["websocket", "polling"],
+    connectTimeout: 10000,
+    pingTimeout: 5000,
+    pingInterval: 10000,
   });
 
-  // 타이핑 상태 처리
-  socket.on("typing", (data) => {
-    const username = users.get(socket.id);
-    if (username) {
-      socket.broadcast.emit("typing", {
-        username: username,
-        isTyping: data.isTyping,
-      });
-    }
+  io.engine.on("connection_error", (err) => {
+    console.error("Connection error:", err);
   });
 
-  // 사용자 연결 해제 처리
-  socket.on("disconnect", () => {
-    const username = users.get(socket.id);
-    if (username) {
-      users.delete(socket.id);
-
-      // 다른 사용자들에게 사용자 퇴장 알림
-      socket.broadcast.emit("user left", {
-        username: username,
-        message: `${username}님이 채팅방을 나갔습니다.`,
-        timestamp: new Date().toLocaleTimeString(),
-      });
-
-      // 현재 접속자 수 업데이트
+  io.on("connection", (socket) => {
+    try {
+      console.log("User connected:", socket.id);
+      users.set(socket.id, "Anonymous");
       io.emit("user count", users.size);
 
-      console.log(`${username} left the chat`);
+      socket.on("join", (username) => {
+        try {
+          console.log("User joined:", username);
+          users.set(socket.id, username);
+          socket.broadcast.emit("user joined", {
+            username,
+            message: `${username}님이 입장했습니다.`,
+            timestamp: new Date().toLocaleTimeString(),
+          });
+          io.emit("user count", users.size);
+        } catch (error) {
+          console.error("Join event error:", error);
+        }
+      });
+
+      socket.on("chat message", (data) => {
+        try {
+          const username = users.get(socket.id);
+          if (username) {
+            const messageData = {
+              username,
+              ...data,
+              timestamp: new Date().toLocaleTimeString(),
+            };
+            io.emit("chat message", messageData);
+          }
+        } catch (error) {
+          console.error("Chat message event error:", error);
+        }
+      });
+
+      socket.on("typing", (data) => {
+        try {
+          const username = users.get(socket.id);
+          if (username) {
+            socket.broadcast.emit("typing", {
+              username,
+              isTyping: data.isTyping,
+            });
+          }
+        } catch (error) {
+          console.error("Typing event error:", error);
+        }
+      });
+
+      socket.on("disconnect", () => {
+        try {
+          const username = users.get(socket.id);
+          if (username && username !== "Anonymous") {
+            socket.broadcast.emit("user left", {
+              username,
+              message: `${username}님이 퇴장했습니다.`,
+              timestamp: new Date().toLocaleTimeString(),
+            });
+          }
+          users.delete(socket.id);
+          io.emit("user count", users.size);
+          console.log("User disconnected:", socket.id);
+        } catch (error) {
+          console.error("Disconnect event error:", error);
+        }
+      });
+
+      socket.on("error", (error) => {
+        console.error("Socket error:", error);
+      });
+    } catch (error) {
+      console.error("Connection handler error:", error);
     }
-
-    console.log("User disconnected:", socket.id);
   });
-});
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log(`> Ready on http://localhost:${PORT}`);
+  });
 });
